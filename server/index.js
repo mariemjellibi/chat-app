@@ -1,11 +1,16 @@
+// imports
 import express from 'express';
 import cors from 'cors';
 import http from 'http';
 import { Server } from 'socket.io';
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
+import User from './models/User.js'; 
+import Message from './models/Message.js';
+
 dotenv.config();
-// Initialize Express
+
+// express and socket
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -13,84 +18,71 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        // origin: "http://localhost:5174",
-        origin:"*",
+        origin: "*", 
         methods: ["GET", "POST"],
     },
 });
 
-// 🔹 Connect to MongoDB
-mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true }).then(() => {
-    console.log("Connected to MongoDB");
-}).catch((error) => {
-    console.error("MongoDB connection error:", error);
-});
+// connect to MongoDB
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+    .then(() => console.log("Connected to MongoDB"))
+    .catch((error) => console.error("MongoDB connection error:", error));
 
-const messageSchema = new mongoose.Schema({
-    user: String,
-    message: String,
-    time: String,
-    room: String
-});
-const Message = mongoose.model("Message", messageSchema);
+let users = {};
 
-let users = {}; // Store connected users
-
-// 🔹 Handle Socket.IO connections
+// Socket.IO handling
 io.on("connection", (socket) => {
     console.log(`User connected: ${socket.id}`);
 
-    // 🔹 User joins a chat room
     socket.on("join_chat", async ({ username, room }) => {
         if (!username || !room) return;
-        
+
         users[socket.id] = { username, room };
         socket.join(room);
-    
+
         io.to(room).emit("update_users", getUsersInRoom(room));
         console.log(`${username} joined room: ${room}`);
-    
-        // 🔹 Fetch previous messages immediately when user joins
+
         try {
-            const messages = await Message.find({ room }).sort({ _id: 1 }).limit(50);
-            socket.emit("previous_messages", messages);
+            // Fetch previous messages for this room
+            const messages = await Message.find({ receiver: room })
+                .sort({ timestamp: 1 })
+                .limit(50);
+
+            socket.emit("previous_messages", messages.map(msg => ({
+                user: msg.sender,
+                message: msg.content,
+                time: msg.timestamp.toLocaleTimeString()
+            })));
         } catch (error) {
             console.error("Error loading messages:", error);
         }
     });
-    
 
-    // 🔹 Load previous messages from MongoDB when user joins a room
-    socket.on("load_messages", async (room) => {
-        try {
-            const messages = await Message.find({ room }).sort({ _id: 1 }).limit(50);
-            socket.emit("previous_messages", messages);
-            console.log("Loaded messages:", messages);
-        } catch (error) {
-            console.error("Error loading messages:", error);
-        }
-    });
+    socket.on("send_message", async ({ user, message, room }) => {
+        if (!user || !message || !room) return;
     
-
-    // 🔹 Handle sending messages
-    socket.on("send_message", async (data) => {
-        const { user, message, room } = data;
-        const messageData = {
-            user, 
-            message, 
-            time: new Date().toLocaleTimeString(), 
-            room
-        };
-    
-        try {
-            await new Message(messageData).save(); // Save message in MongoDB
-            io.to(room).emit("receive_message", messageData); // Send to all users in room
-        } catch (error) {
+        const newMessage = new Message({
+            sender: user,
+            receiver: room,
+            content: message,
+          });
+          
+          try {
+            const savedMessage = await newMessage.save();
+            io.to(room).emit("receive_message", {
+              user: savedMessage.sender,
+              message: savedMessage.content,
+              time: savedMessage.timestamp.toLocaleTimeString(),
+            });
+          } catch (error) {
             console.error("Error saving message:", error);
-        }
+            socket.emit("error_message", "Message could not be saved");
+          }
+          
     });
     
-    // 🔹 Typing Indicator
+
     socket.on("typing", (room) => {
         const username = users[socket.id]?.username || "Unknown";
         socket.broadcast.to(room).emit("display_typing", username);
@@ -100,7 +92,6 @@ io.on("connection", (socket) => {
         socket.broadcast.to(room).emit("hide_typing");
     });
 
-    // 🔹 Handle User Disconnect
     socket.on("disconnect", () => {
         const user = users[socket.id];
         if (user) {
@@ -111,11 +102,22 @@ io.on("connection", (socket) => {
     });
 });
 
-// Helper function to get users in a room
+// Route
+app.get('/api/professors', async (req, res) => {
+    try {
+        const professors = await User.find({ role: 'professor' }).select('-password');
+        res.json(professors);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch professors' });
+    }
+});
+
+// Helper
 const getUsersInRoom = (room) => {
     return Object.values(users).filter(user => user.room === room);
 };
 
+// Start server
 server.listen(3000, () => {
     console.log("Server is running on port 3000");
 });
